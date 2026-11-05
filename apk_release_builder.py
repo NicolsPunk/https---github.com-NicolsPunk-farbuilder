@@ -128,12 +128,24 @@ def migrate_config(cfg: dict) -> dict:
     return cfg
 
 
-def apk_file_name(base: str, major: int, minor: int, patch: int) -> str:
-    """test_app + 1.2.5 → test_app_v1.2.5.apk"""
-    clean = _RE_BAD_FILENAME_CHARS.sub("_", base.strip()).strip("_.")
+# Что дописывается к имени APK: версия (1.2.5) или номер сборки (versionCode).
+APK_SUFFIX_VERSION = "version"
+APK_SUFFIX_BUILD = "build"
+
+
+def apk_suffix_value(kind: str, major: int, minor: int, patch: int, version_code: int) -> str:
+    if kind == APK_SUFFIX_BUILD:
+        return str(version_code)
+    return f"{major}.{minor}.{patch}"
+
+
+def apk_file_name(base: str, suffix: str) -> str:
+    """Имя как введено + версия или номер сборки, без разделителя:
+    test_app_v + 1.2.5 → test_app_v1.2.5.apk."""
+    clean = _RE_BAD_FILENAME_CHARS.sub("_", base.strip())
     if not clean:
         raise ValueError("Укажите имя APK")
-    return f"{clean}_v{major}.{minor}.{patch}.apk"
+    return f"{clean}{suffix}.apk"
 
 
 def pubspec_app_name(pub: Path) -> str:
@@ -459,8 +471,9 @@ class BuilderApp(tk.Tk):
         self.project_root = tk.StringVar(value=project_key(start))
         self.app_dart_rel = tk.StringVar()
         self.pubspec_rel = tk.StringVar()
-        # Имя APK без версии: «test_app» → test_app_v1.2.5.apk
+        # Имя APK как введено + версия или номер сборки: «test_app_v» → test_app_v1.2.5.apk
         self.apk_name_var = tk.StringVar()
+        self.apk_suffix_var = tk.StringVar(value=APK_SUFFIX_VERSION)
         self.apk_preview_var = tk.StringVar()
         self._load_project_settings(start)
 
@@ -468,7 +481,14 @@ class BuilderApp(tk.Tk):
         self.minor_var = tk.IntVar(value=0)
         self.patch_var = tk.IntVar(value=0)
         self.code_var = tk.IntVar(value=1)
-        for var in (self.major_var, self.minor_var, self.patch_var, self.apk_name_var):
+        for var in (
+            self.major_var,
+            self.minor_var,
+            self.patch_var,
+            self.code_var,
+            self.apk_name_var,
+            self.apk_suffix_var,
+        ):
             var.trace_add("write", lambda *_: self._update_apk_preview())
 
         self._flags: list[FlagDef] = []
@@ -488,6 +508,7 @@ class BuilderApp(tk.Tk):
         self.app_dart_rel.set(proj.get("app_dart") or "lib/src/app.dart")
         self.pubspec_rel.set(proj.get("pubspec") or "pubspec.yaml")
         self.apk_name_var.set(proj.get("apk_name") or "")
+        self.apk_suffix_var.set(proj.get("apk_suffix") or APK_SUFFIX_VERSION)
 
     def _recent_projects(self) -> list[str]:
         return list(self._cfg_disk.get("recent_projects") or [])
@@ -507,14 +528,20 @@ class BuilderApp(tk.Tk):
         self._load_project_settings(root)
         self.reload_from_app()
 
+    def _apk_suffix(self) -> str:
+        return apk_suffix_value(
+            self.apk_suffix_var.get(),
+            int(self.major_var.get()),
+            int(self.minor_var.get()),
+            int(self.patch_var.get()),
+            int(self.code_var.get()),
+        )
+
     def _update_apk_preview(self) -> None:
+        if not hasattr(self, "code_var"):
+            return
         try:
-            name = apk_file_name(
-                self.apk_name_var.get(),
-                int(self.major_var.get()),
-                int(self.minor_var.get()),
-                int(self.patch_var.get()),
-            )
+            name = apk_file_name(self.apk_name_var.get(), self._apk_suffix())
             self.apk_preview_var.set(f"→ {name} (и {APK_DEFAULT_NAME})")
         except (ValueError, tk.TclError):
             self.apk_preview_var.set(f"→ только {APK_DEFAULT_NAME}")
@@ -585,7 +612,7 @@ class BuilderApp(tk.Tk):
         )
         self._version_spinner(row, "code", self.code_var).pack(side=tk.LEFT)
 
-        apk = ttk.LabelFrame(root, text="Имя APK (версия добавляется автоматически)", padding=8)
+        apk = ttk.LabelFrame(root, text="Имя APK (в конце — версия или номер сборки)", padding=8)
         apk.pack(fill=tk.X, pady=(10, 0))
         apk_row = ttk.Frame(apk)
         apk_row.pack(fill=tk.X)
@@ -593,7 +620,13 @@ class BuilderApp(tk.Tk):
         ttk.Entry(apk_row, textvariable=self.apk_name_var, width=28).pack(
             side=tk.LEFT, padx=8
         )
-        ttk.Label(apk_row, textvariable=self.apk_preview_var).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            apk_row, text="версия", value=APK_SUFFIX_VERSION, variable=self.apk_suffix_var
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            apk_row, text="номер сборки", value=APK_SUFFIX_BUILD, variable=self.apk_suffix_var
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(apk, textvariable=self.apk_preview_var).pack(anchor=tk.W, pady=(6, 0))
 
         flags = ttk.LabelFrame(root, text="Флаги (из /// + const)", padding=8)
         flags.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -713,7 +746,8 @@ class BuilderApp(tk.Tk):
             self.patch_var.set(ver["patch"])
             self.code_var.set(ver["versionCode"])
             if not self.apk_name_var.get().strip():
-                self.apk_name_var.set(pubspec_app_name(pub))
+                default_name = pubspec_app_name(pub)
+                self.apk_name_var.set(f"{default_name}_v" if default_name else "")
             # сохранённые значения флагов — только этого проекта
             disk_flags = self._project_cfg(root).get("flags") or {}
             self._rebuild_flag_widgets(flags, disk_flags)
@@ -749,6 +783,7 @@ class BuilderApp(tk.Tk):
             "versionCode": int(self.code_var.get()),
             "flags": flag_vals,
             "apk_name": self.apk_name_var.get().strip(),
+            "apk_suffix": self.apk_suffix_var.get(),
         }
 
     def save_only(self) -> None:
@@ -762,7 +797,14 @@ class BuilderApp(tk.Tk):
         try:
             cfg = self._collect_cfg()
             named_apk = apk_file_name(
-                cfg["apk_name"], cfg["major"], cfg["minor"], cfg["patch"]
+                cfg["apk_name"],
+                apk_suffix_value(
+                    cfg["apk_suffix"],
+                    cfg["major"],
+                    cfg["minor"],
+                    cfg["patch"],
+                    cfg["versionCode"],
+                ),
             )
             root, _, _ = self._write_files(cfg)
         except Exception as e:
@@ -799,6 +841,7 @@ class BuilderApp(tk.Tk):
             "pubspec": cfg["pubspec"],
             "flags": cfg["flags"],
             "apk_name": cfg["apk_name"],
+            "apk_suffix": cfg["apk_suffix"],
         }
         self._remember_project(root)
         ver = f"{cfg['major']}.{cfg['minor']}.{cfg['patch']}+{cfg['versionCode']}"

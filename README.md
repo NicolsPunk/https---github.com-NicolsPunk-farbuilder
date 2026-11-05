@@ -58,7 +58,7 @@ python apk_release_builder.py
 
 ## Имя APK
 
-В блоке «Имя APK» задаётся имя без версии, например `test_app` (по умолчанию — `name:` из `pubspec.yaml`). После сборки в `build/app/outputs/flutter-apk/` остаётся `app-release.apk` и появляется копия `test_app_v1.2.5.apk` — версия `major.minor.patch` подставляется автоматически.
+В блоке «Имя APK» задаётся начало имени — как есть, без автоматического `_` (по умолчанию `<name из pubspec.yaml>_v`). Переключатель выбирает, что дописать в конец: **версию** `major.minor.patch` или **номер сборки** (`kAppVersionCode`). Например, `test_app_v` → `test_app_v1.2.5.apk` или `test_app_b` → `test_app_b80.apk`. После сборки в `build/app/outputs/flutter-apk/` остаётся `app-release.apk` и рядом появляется копия с этим именем.
 
 «Открыть папку сборки» открывает `build/app/outputs/flutter-apk/` в проводнике.
 
