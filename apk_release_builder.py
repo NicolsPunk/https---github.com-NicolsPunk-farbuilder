@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -18,6 +20,15 @@ TOOL_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = TOOL_DIR / "apk_release_builder_config.json"
 
 VERSION_NAMES = ("major", "minor", "patch", "kAppVersionCode")
+
+# Папка и имя APK, которые создаёт `flutter build apk --release`.
+APK_OUTPUT_DIR = Path("build") / "app" / "outputs" / "flutter-apk"
+APK_DEFAULT_NAME = "app-release.apk"
+# Сколько последних открытых проектов помнить.
+RECENT_PROJECTS_LIMIT = 15
+# Недопустимые в имени файла Windows символы.
+_RE_BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\s]+')
+_RE_PUBSPEC_NAME = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
 
 # const bool/int/String name = ...;
 _RE_TYPED = re.compile(
@@ -90,6 +101,56 @@ def save_config(cfg: dict) -> None:
 def default_project_root() -> Path:
     # farbuilder лежит в корне Flutter-проекта.
     return TOOL_DIR.parent
+
+
+def project_key(root: str | Path) -> str:
+    """Ключ проекта в конфиге: нормализованный абсолютный путь."""
+    return str(Path(root).resolve())
+
+
+def migrate_config(cfg: dict) -> dict:
+    """Старый формат (один проект на верхнем уровне) → projects[путь] + история."""
+    cfg = dict(cfg)
+    projects = dict(cfg.get("projects") or {})
+    old_root = cfg.pop("project_root", None)
+    old = {k: cfg.pop(k) for k in ("app_dart", "pubspec", "flags") if k in cfg}
+    for k in ("major", "minor", "patch", "versionCode"):
+        cfg.pop(k, None)
+    if old_root:
+        key = project_key(old_root)
+        projects.setdefault(key, old)
+        recent = list(cfg.get("recent_projects") or [])
+        if key not in recent:
+            recent.insert(0, key)
+        cfg["recent_projects"] = recent
+        cfg.setdefault("last_project", key)
+    cfg["projects"] = projects
+    return cfg
+
+
+def apk_file_name(base: str, major: int, minor: int, patch: int) -> str:
+    """test_app + 1.2.5 → test_app_v1.2.5.apk"""
+    clean = _RE_BAD_FILENAME_CHARS.sub("_", base.strip()).strip("_.")
+    if not clean:
+        raise ValueError("Укажите имя APK")
+    return f"{clean}_v{major}.{minor}.{patch}.apk"
+
+
+def pubspec_app_name(pub: Path) -> str:
+    try:
+        m = _RE_PUBSPEC_NAME.search(read_text(pub))
+    except Exception:
+        return ""
+    return m.group(1) if m else ""
+
+
+def open_folder(path: Path) -> None:
+    if sys.platform == "win32":
+        os.startfile(str(path))  # noqa: S606 — открыть в Проводнике
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def resolve_paths(cfg: dict) -> tuple[Path, Path, Path]:
@@ -393,25 +454,22 @@ class BuilderApp(tk.Tk):
         self.geometry("720x860")
         self.minsize(640, 700)
 
-        self._cfg_disk = load_config()
-        self.project_root = tk.StringVar(
-            value=str(
-                Path(
-                    self._cfg_disk.get("project_root") or default_project_root()
-                ).resolve()
-            )
-        )
-        self.app_dart_rel = tk.StringVar(
-            value=self._cfg_disk.get("app_dart") or "lib/src/app.dart"
-        )
-        self.pubspec_rel = tk.StringVar(
-            value=self._cfg_disk.get("pubspec") or "pubspec.yaml"
-        )
+        self._cfg_disk = migrate_config(load_config())
+        start = self._cfg_disk.get("last_project") or str(default_project_root())
+        self.project_root = tk.StringVar(value=project_key(start))
+        self.app_dart_rel = tk.StringVar()
+        self.pubspec_rel = tk.StringVar()
+        # Имя APK без версии: «test_app» → test_app_v1.2.5.apk
+        self.apk_name_var = tk.StringVar()
+        self.apk_preview_var = tk.StringVar()
+        self._load_project_settings(start)
 
         self.major_var = tk.IntVar(value=0)
         self.minor_var = tk.IntVar(value=0)
         self.patch_var = tk.IntVar(value=0)
         self.code_var = tk.IntVar(value=1)
+        for var in (self.major_var, self.minor_var, self.patch_var, self.apk_name_var):
+            var.trace_add("write", lambda *_: self._update_apk_preview())
 
         self._flags: list[FlagDef] = []
         self._flag_vars: dict[str, tk.Variable] = {}
@@ -419,6 +477,60 @@ class BuilderApp(tk.Tk):
 
         self._build_ui()
         self.reload_from_app()
+
+    # ---------- проекты: история и настройки по папке ----------
+
+    def _project_cfg(self, root: str | Path) -> dict:
+        return (self._cfg_disk.get("projects") or {}).get(project_key(root), {})
+
+    def _load_project_settings(self, root: str | Path) -> None:
+        proj = self._project_cfg(root)
+        self.app_dart_rel.set(proj.get("app_dart") or "lib/src/app.dart")
+        self.pubspec_rel.set(proj.get("pubspec") or "pubspec.yaml")
+        self.apk_name_var.set(proj.get("apk_name") or "")
+
+    def _recent_projects(self) -> list[str]:
+        return list(self._cfg_disk.get("recent_projects") or [])
+
+    def _remember_project(self, root: Path) -> None:
+        key = project_key(root)
+        recent = [p for p in self._recent_projects() if p != key]
+        recent.insert(0, key)
+        self._cfg_disk["recent_projects"] = recent[:RECENT_PROJECTS_LIMIT]
+        self._cfg_disk["last_project"] = key
+        save_config(self._cfg_disk)
+        if hasattr(self, "root_combo"):
+            self.root_combo.configure(values=self._cfg_disk["recent_projects"])
+
+    def _switch_project(self, root: str) -> None:
+        self.project_root.set(project_key(root))
+        self._load_project_settings(root)
+        self.reload_from_app()
+
+    def _update_apk_preview(self) -> None:
+        try:
+            name = apk_file_name(
+                self.apk_name_var.get(),
+                int(self.major_var.get()),
+                int(self.minor_var.get()),
+                int(self.patch_var.get()),
+            )
+            self.apk_preview_var.set(f"→ {name} (и {APK_DEFAULT_NAME})")
+        except (ValueError, tk.TclError):
+            self.apk_preview_var.set(f"→ только {APK_DEFAULT_NAME}")
+
+    def _open_build_dir(self) -> None:
+        root, _, _ = self._paths()
+        folder = root / APK_OUTPUT_DIR
+        if not folder.is_dir():
+            messagebox.showinfo(
+                "Сборка", f"Папки ещё нет — сначала соберите APK:\n{folder}"
+            )
+            return
+        try:
+            open_folder(folder)
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
 
     def _paths(self) -> tuple[Path, Path, Path]:
         return resolve_paths(
@@ -438,8 +550,14 @@ class BuilderApp(tk.Tk):
         pr = ttk.Frame(paths)
         pr.pack(fill=tk.X)
         ttk.Label(pr, text="Корень").pack(side=tk.LEFT)
-        ttk.Entry(pr, textvariable=self.project_root).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=8
+        # Выпадающий список — ранее открытые проекты.
+        self.root_combo = ttk.Combobox(
+            pr, textvariable=self.project_root, values=self._recent_projects()
+        )
+        self.root_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self.root_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._switch_project(self.project_root.get()),
         )
         ttk.Button(pr, text="…", width=3, command=self._pick_root).pack(side=tk.LEFT)
         ar = ttk.Frame(paths)
@@ -466,6 +584,16 @@ class BuilderApp(tk.Tk):
             side=tk.LEFT, padx=(0, 12)
         )
         self._version_spinner(row, "code", self.code_var).pack(side=tk.LEFT)
+
+        apk = ttk.LabelFrame(root, text="Имя APK (версия добавляется автоматически)", padding=8)
+        apk.pack(fill=tk.X, pady=(10, 0))
+        apk_row = ttk.Frame(apk)
+        apk_row.pack(fill=tk.X)
+        ttk.Label(apk_row, text="Имя").pack(side=tk.LEFT)
+        ttk.Entry(apk_row, textvariable=self.apk_name_var, width=28).pack(
+            side=tk.LEFT, padx=8
+        )
+        ttk.Label(apk_row, textvariable=self.apk_preview_var).pack(side=tk.LEFT)
 
         flags = ttk.LabelFrame(root, text="Флаги (из /// + const)", padding=8)
         flags.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -494,6 +622,9 @@ class BuilderApp(tk.Tk):
             command=self.save_and_build,
         )
         self.build_btn.pack(side=tk.LEFT, padx=8)
+        ttk.Button(
+            actions, text="Открыть папку сборки", command=self._open_build_dir
+        ).pack(side=tk.LEFT)
 
         log_frame = ttk.LabelFrame(root, text="Лог сборки", padding=4)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -505,8 +636,7 @@ class BuilderApp(tk.Tk):
             initialdir=self.project_root.get() or str(default_project_root())
         )
         if d:
-            self.project_root.set(d)
-            self.reload_from_app()
+            self._switch_project(d)
 
     def _version_spinner(self, parent: ttk.Frame, title: str, var: tk.IntVar) -> ttk.Frame:
         box = ttk.Frame(parent)
@@ -572,7 +702,7 @@ class BuilderApp(tk.Tk):
 
     def reload_from_app(self) -> None:
         try:
-            root, app, _pub = self._paths()
+            root, app, pub = self._paths()
             if not app.is_file():
                 raise FileNotFoundError(f"Не найден {app}")
             src = read_text(app)
@@ -582,9 +712,12 @@ class BuilderApp(tk.Tk):
             self.minor_var.set(ver["minor"])
             self.patch_var.set(ver["patch"])
             self.code_var.set(ver["versionCode"])
-            # подтянуть сохранённые значения только для известных имён
-            disk_flags = (self._cfg_disk.get("flags") or {}) if self._cfg_disk else {}
+            if not self.apk_name_var.get().strip():
+                self.apk_name_var.set(pubspec_app_name(pub))
+            # сохранённые значения флагов — только этого проекта
+            disk_flags = self._project_cfg(root).get("flags") or {}
             self._rebuild_flag_widgets(flags, disk_flags)
+            self._remember_project(root)
             self._append_log(
                 f"Прочитано: {app.relative_to(root)} — "
                 f"флагов {len(flags)}, версия "
@@ -615,6 +748,7 @@ class BuilderApp(tk.Tk):
             "patch": int(self.patch_var.get()),
             "versionCode": int(self.code_var.get()),
             "flags": flag_vals,
+            "apk_name": self.apk_name_var.get().strip(),
         }
 
     def save_only(self) -> None:
@@ -627,6 +761,9 @@ class BuilderApp(tk.Tk):
     def save_and_build(self) -> None:
         try:
             cfg = self._collect_cfg()
+            named_apk = apk_file_name(
+                cfg["apk_name"], cfg["major"], cfg["minor"], cfg["patch"]
+            )
             root, _, _ = self._write_files(cfg)
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
@@ -634,7 +771,7 @@ class BuilderApp(tk.Tk):
         self.build_btn.configure(state=tk.DISABLED)
         self._append_log("\n=== flutter build apk --release ===\n")
         threading.Thread(
-            target=self._run_build, args=(root,), daemon=True
+            target=self._run_build, args=(root, named_apk), daemon=True
         ).start()
 
     def _write_files(self, cfg: dict) -> tuple[Path, Path, Path]:
@@ -656,8 +793,14 @@ class BuilderApp(tk.Tk):
         out = apply_flag_values(out, flags, cfg["flags"])
         write_text(app, out)
         write_text(pub, apply_pubspec(read_text(pub), cfg))
-        save_config(cfg)
-        self._cfg_disk = cfg
+        projects = self._cfg_disk.setdefault("projects", {})
+        projects[project_key(root)] = {
+            "app_dart": cfg["app_dart"],
+            "pubspec": cfg["pubspec"],
+            "flags": cfg["flags"],
+            "apk_name": cfg["apk_name"],
+        }
+        self._remember_project(root)
         ver = f"{cfg['major']}.{cfg['minor']}.{cfg['patch']}+{cfg['versionCode']}"
         self._append_log(
             f"Сохранено: {ver} → {app.name}, {pub.name}, {CONFIG_PATH.name}\n"
@@ -666,7 +809,7 @@ class BuilderApp(tk.Tk):
         self._flags = parse_flags(out, app)
         return root, app, pub
 
-    def _run_build(self, root: Path) -> None:
+    def _run_build(self, root: Path, named_apk: str) -> None:
         try:
             proc = subprocess.Popen(
                 ["flutter", "build", "apk", "--release"],
@@ -682,21 +825,20 @@ class BuilderApp(tk.Tk):
             for line in proc.stdout:
                 self.after(0, self._append_log, line)
             code = proc.wait()
-            msg = (
-                f"\nСборка успешна (exit {code}).\n"
-                f"APK: build/app/outputs/flutter-apk/app-release.apk\n"
-                if code == 0
-                else f"\nСборка завершилась с ошибкой (exit {code}).\n"
-            )
-            self.after(0, self._append_log, msg)
-            if code == 0:
+            if code != 0:
                 self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "APK",
-                        "Сборка готова:\nbuild/app/outputs/flutter-apk/app-release.apk",
-                    ),
+                    0, self._append_log, f"\nСборка завершилась с ошибкой (exit {code}).\n"
                 )
+                return
+            # app-release.apk остаётся, рядом — копия с именем и версией.
+            out_dir = root / APK_OUTPUT_DIR
+            shutil.copy2(out_dir / APK_DEFAULT_NAME, out_dir / named_apk)
+            done = (
+                f"Сборка готова:\n{APK_OUTPUT_DIR / APK_DEFAULT_NAME}\n"
+                f"{APK_OUTPUT_DIR / named_apk}"
+            )
+            self.after(0, self._append_log, f"\nСборка успешна (exit 0).\n{done}\n")
+            self.after(0, lambda: messagebox.showinfo("APK", done))
         except Exception as e:
             self.after(0, self._append_log, f"\nОшибка запуска: {e}\n")
             self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))

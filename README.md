@@ -54,6 +54,12 @@ apk_release_builder.bat
 python apk_release_builder.py
 ```
 
-В поле «Корень» укажите корень Flutter-проекта (по умолчанию — родитель каталога `farbuilder`). Путь к `app.dart` относительно корня (по умолчанию `lib/src/app.dart`).
+В поле «Корень» укажите корень Flutter-проекта (по умолчанию — родитель каталога `farbuilder`). Путь к `app.dart` относительно корня (по умолчанию `lib/src/app.dart`). В выпадающем списке «Корень» — все ранее открытые проекты; у каждого свои флаги, пути и имя APK.
 
-Локальный `apk_release_builder_config.json` сохраняет последний выбор и в git не коммитится.
+## Имя APK
+
+В блоке «Имя APK» задаётся имя без версии, например `test_app` (по умолчанию — `name:` из `pubspec.yaml`). После сборки в `build/app/outputs/flutter-apk/` остаётся `app-release.apk` и появляется копия `test_app_v1.2.5.apk` — версия `major.minor.patch` подставляется автоматически.
+
+«Открыть папку сборки» открывает `build/app/outputs/flutter-apk/` в проводнике.
+
+Локальный `apk_release_builder_config.json` хранит историю проектов и их настройки и в git не коммитится.
